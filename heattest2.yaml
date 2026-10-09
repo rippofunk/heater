@@ -1,0 +1,275 @@
+# Board: Seeed Studio XIAO ESP32C6 (Seeed Studio)
+# Definition: definitions/boards/seeed_xiao_esp32c6/manifest.yaml
+
+esphome:
+  name: heattest2
+  friendly_name: heattest2
+
+esp32:
+  variant: esp32c6
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: "QOqdnEI0q1eHOZ7la6j/vo5UirKbYJ1v4bw8nNZYV+Y="
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: heattest2 Fallback Hotspot
+    password: "TDnxWOpLaK4u"
+
+captive_portal:
+
+# available pins,GPIO0, GPIO1, GPIO2,GPIO21,GPIO22,GPIO23,GPIO16,GPIO18,GPIO20,GPIO19, GPIO17
+# GPIO0 Analog in Temp -- Temp replay spot
+# GPIO1 Analog in Temp
+# GPIO2 Analog in Temp
+# GPIO21 Glow Plug
+# GPIO22 i2c Screen
+# GPIO23 i2C Screen
+# GPIO16 Diesel Pump
+# GPIO18 Rotary Encoder 
+# GPIO20 Rotary encoder
+# GPIO17 Blower Fan
+# GPIO19 Rotary Switch
+
+# i2c Screen and Analog to digital
+
+  
+# Configure the physical pin firing the pump's transistor/MOSFET driver
+output:
+  - platform: gpio
+    pin: GPIO16
+    id: pump_pin
+  - platform: ledc
+    pin: GPIO19
+    id: blower_pin  
+  - platform: ledc
+    pin: GPIO21
+    id: glow_plug
+    
+time:
+  - platform: homeassistant
+    id: esptime
+    
+sensor:
+  - platform: rotary_encoder
+    name: "Heater Power"
+    id: heater_power
+    pin_a: GPIO18
+    pin_b: GPIO20
+    min_value: 1
+    max_value: 10
+    publish_initial_value: true
+    resolution: 1
+    on_clockwise:
+      lambda: |-
+        if(id(heater_power).state == 10){
+          id(heater_power).state = 1;
+        } else {
+          id(heater_power).state = id(heater_power).state + 1;
+        }
+    on_anticlockwise:
+      lambda: |- 
+        if(id(heater_power).state == 1){
+          id(heater_power).state = 10;
+        } else {
+          id(heater_power).state = id(heater_power).state - 1;
+        }
+
+i2c:
+  sda: GPIO22
+  scl: GPIO23
+  scan: true
+
+font:
+  # gfonts://family[@weight]
+  - file: "gfonts://Roboto"
+    id: roboto
+    size: 55
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 900
+    id: font2
+    size: 10
+  - file:
+      type: gfonts
+      family: Roboto
+    id: font3
+    size: 53
+    
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    id: display1
+    pages:
+          - id: page1
+            lambda: |-
+              it.printf(0, 0, id(roboto), "ON" );
+              it.line(0, 54, 128,54 );
+              it.print(0,55, id(font2), "Heater" );
+          - id: page2
+            lambda: |-
+              it.printf(0, 0, id(roboto), "%.0f", id(heater_power).state );
+              it.line(0, 54, 128,54 );
+              it.print(0,55, id(font2), "Outside" );
+          - id: page3
+            lambda: |-
+              it.printf(0,0, id(roboto), "OFF" );
+              it.line(0, 54, 128,54 );
+              it.print(0,55, id(font2), "Heater" );
+#3 sensors, wayter in, water out, and exhaust
+
+# Create a toggle in Home Assistant to start/stop the pump
+switch:
+  - platform: template
+    name: "Diesel Pump State"
+    id: pump_enable
+    optimistic: true
+    turn_on_action: 
+      - script.execute: pump_loop
+      - logger.log: "ONnnnnn"
+    turn_off_action:
+      - output.turn_off: pump_pin
+      - script.stop: pump_loop
+      - logger.log: "OFFFFF"
+  - platform: gpio
+    name: "Relay"
+    pin: GPIO0
+  - platform: template
+    name: "Blower Motor"
+    id: blower_enable
+    optimistic: true
+    turn_on_action: 
+      - lambda: |-
+          id(blower_pin).set_level(id(blower_percent).state);
+    turn_off_action:
+      - output.turn_off: blower_pin
+        
+  - platform: template
+    name: "Heater State"
+    id: heater_state
+    optimistic: true
+    turn_on_action:
+      then:
+        - display.page.show: page1
+        - delay: 2s
+        - display.page.show: page2
+    turn_off_action: 
+      then:
+        - display.page.show: page3
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO17
+      mode: INPUT_PULLUP
+    name: "Rotary Switch"   
+    id: rswitch
+    on_press:
+      then:
+        - switch.toggle: heater_state
+# Slider to adjust pump frequency (Clicks per second)
+number:
+  - platform: template
+    name: "Pump Frequency"
+    id: pump_hz
+    min_value: 1.0
+    max_value: 6.0
+    step: 0.1
+    initial_value: 1.5
+    unit_of_measurement: "Hz"
+    optimistic: true
+  - platform: template
+    name: "Blower percent"
+    id: blower_percent
+    min_value: .1
+    max_value: 1
+    step: .1
+    initial_value: 1
+    unit_of_measurement: "%"
+    optimistic: true
+    on_value:
+      then:
+        - lambda: |-
+            id(blower_pin).set_level(x);
+
+# Background script handling the precise timing loop
+script:
+  - id: pump_loop
+    mode: restart
+    then:
+      - delay: 0s
+      - while:
+          condition:
+            - switch.is_on: pump_enable
+          then:
+            - logger.log: "lets go"
+            # 1. Turn pump ON
+            - output.turn_on: pump_pin
+            # 2. Keep ON for exactly 25ms
+            - delay: 25ms
+            # 3. Turn pump OFF
+            - output.turn_off: pump_pin
+            # 4. Calculate remaining cycle time dynamically: (1000ms / Hz) - 25ms
+            - delay: !lambda |-
+                float hz = id(pump_hz).state;
+                float total_cycle_ms = 1000.0 / hz;
+                float off_time_ms = total_cycle_ms - 25.0;
+                return (uint32_t)off_time_ms;
+          
+      - logger.log: "NOPEp"
+  - id: start_up
+    mode: single
+    then:
+      - lambda: id(blower_pin).set_level(.1);
+      - switch.turn_on: blower_enable
+      - delay: 3s
+      - lambda: id(blower_pin).set_level(.5);
+      - delay: 3s
+      - lambda: id(blower_pin).set_level(1);
+  - id: ignitor_start
+    mode: single
+    then:
+      - lambda: id(glow_plug).set_level(.7);
+  - id: run
+    mode: restart
+    then:
+      # find the level
+      - lambda: |-
+          float level = id(heater_power).state * .1;
+          id(blower_pin).set_level(level);
+      - delay: 10s
+        
+      # do some translation for diesel pump
+  - id: shutdown2
+    mode: single
+    then:
+      - switch.turn_off: pump_enable
+      # check temps if low temps slow down fan. 
+      - while:
+          condition:
+            - lambda: return id(blower_percent).state > .5;
+          then:
+          # temps > 50 
+            - lambda: id(blower_percent).state = .5;
+            - delay: 30s
+              
+          
+        
+    
+# on start up run fan for 20secs
+# after 20 seconds run glow plug
+# run glow plug for X seconds
+# after glow plug is warmed i inject some diesel to get it going
+# Once i verify its going, turn off glow plufg
