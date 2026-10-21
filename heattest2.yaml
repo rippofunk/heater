@@ -32,11 +32,42 @@ wifi:
 
 captive_portal:
 
+# available pins,GPIO0, GPIO1, GPIO2,GPIO21,GPIO22,GPIO23,GPIO16,GPIO18,GPIO20,GPIO19, GPIO17
+# GPIO0 Temp replay spot
+# GPIO1 
+# GPIO2 
+# GPIO21 Combustion Blower
+# GPIO22 i2c 
+# GPIO23 i2C 
+# GPIO16 Diesel Pump
+# GPIO18  
+# GPIO20 
+# GPIO17 
+# GPIO19 Glow Plug
 
 globals:
   - id: ex_temp_now
     type: float
     initial_value: '0.0'
+  - id: min_fan_speed
+    type: float
+    initial_value: '0.3'
+  - id: min_pump_speed
+    type: float
+    initial_value: '0.4'
+  - id: min_exhaust_temp
+    type: float
+    initial_value: '130.0'
+  - id: max_exhaust_temp
+    type: float
+    initial_value: '230'
+  - id: max_floor_temp
+    type: float
+    initial_value: '100'
+  - id: max_water_temp
+    type: float
+    initial_value: '180'
+    
 # Configure the physical pin firing the pump's transistor/MOSFET driver
 output:
   - platform: gpio
@@ -45,18 +76,17 @@ output:
   - platform: ledc
     pin: GPIO21
     id: blower_pin  
-  - platform: ledc
-    pin: GPIO19
-    id: glow_plug
-  - platform: gpio
-    pin: GPIO17
-    id: water_pump
+
     
 time:
   - platform: homeassistant
     id: esptime
     
 sensor:
+  - platform: homeassistant
+    id: floor_temp
+    entity_id: sensor.thermo_tempsensor5  # The exact entity ID from Home Assistant
+    internal: false  
   - platform: ads1115
     multiplexer: 'A0_GND'
     gain: 2.048
@@ -162,6 +192,7 @@ sensor:
           float temp_f = (temp_c * 9.0 / 5.0) + 32.0;
           
           return temp_f;
+ 
 i2c:
   sda: GPIO22
   scl: GPIO23
@@ -190,29 +221,19 @@ switch:
           id(blower_pin).set_level(id(blower_percent).state);
     turn_off_action:
       - output.turn_off: blower_pin
-  - platform: template
+  - platform: gpio
+    pin: GPIO19
     name: "Glow Plug Switch"
-    id: glow_plug_swicth
-    restore_mode: ALWAYS_OFF
-    optimistic: true
-    turn_on_action: 
-      - lambda: |-
-          id(glow_plug).set_level(id(glow_plug_freq).state);
-    turn_off_action:
-      - output.turn_off: blower_pin
+    id: glow_plug_switch
   - platform: template
     name: "start has run"
     id: startran
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
-  - platform: template
+  - platform: gpio
+    pin: GPIO17
     name: "Water Pump Switch"
     id: water_pump_switch
-    optimistic: true
-    turn_on_action: 
-      - output.turn_on: water_pump
-    turn_off_action: 
-      - output.turn_off: water_pump
   - platform: template
     name: "Heater State"
     id: heater_state
@@ -220,7 +241,6 @@ switch:
     turn_on_action:
       then:
         - switch.turn_off: startran
-        - script.execute: run
     turn_off_action: 
       then:
         - script.execute: shutdown2
@@ -229,15 +249,20 @@ switch:
     id: startup
     optimistic: true
     turn_on_action: 
-      - script.execute: run
-      - script.wait: run
-
+      - script.execute: start_up1
+    turn_off_action: 
+      - script.stop: start_up1
+  - platform: template
+    name: "Override Auto"
+    id: overrideauto
+    optimistic: true
+    restore_mode: ALWAYS_OFF
 number:
   - platform: template
     name: "Pump Frequency"
     id: pump_hz
-    min_value: .2
-    max_value: 6.0
+    min_value: .3
+    max_value: 2.0
     step: 0.1
     initial_value: 1.0
     unit_of_measurement: "Hz"
@@ -245,9 +270,9 @@ number:
   - platform: template
     name: "Blower percent"
     id: blower_percent
-    min_value: 0
+    min_value: 0.3
     max_value: 1
-    step: .1
+    step: 0.1
     initial_value: 1
     unit_of_measurement: "%"
     optimistic: true
@@ -255,20 +280,7 @@ number:
       then:
         - lambda: |-
             id(blower_pin).set_level(x);
-      # need to add a If on
-  - platform: template
-    name: "Glow Plug Frequency"
-    id: glow_plug_freq
-    min_value: .0
-    max_value: 1
-    step: 0.1
-    initial_value: 0
-    unit_of_measurement: "%"
-    optimistic: true
-    on_value:
-      then:
-        - lambda: |-
-            id(glow_plug).set_level(x);
+
 # Background script handling the precise timing loop
 script:
   - id: pump_loop
@@ -277,11 +289,7 @@ script:
       - delay: 0s
       - while:
           condition:
-            all:
-              - switch.is_on: pump_enable
-              - sensor.in_range:
-                  id: exhaust_temp
-                  below: 225
+            - switch.is_on: pump_enable
           then:
             - logger.log: "pump pump"
             # 1. Turn pump ON
@@ -292,69 +300,167 @@ script:
             - output.turn_off: pump_pin
             # 4. Calculate remaining cycle time dynamically: (1000ms / Hz) - 25ms
             - delay: !lambda |-
-                float hz = id(pump_hz).state;
-                float total_cycle_ms = 1000.0 / hz;
+                float base_hz = id(pump_hz).state;
+                float total_cycle_ms = 1000.0 / base_hz;
                 float off_time_ms = total_cycle_ms - 25.0;
                 return (uint32_t)off_time_ms;
+            - script.execute: safety_checks
+            - if:
+                condition:
+                  all:
+                    - switch.is_off: startup
+                    - switch.is_off: overrideauto
+                    - not:
+                      - script.is_running:
+                          id: scale_heat
+                then:                 
+                  script.execute: scale_heat
+                
+  - id: safety_checks
+    mode: single
+    then:
+      - lambda: |- 
+          // shut offs
+          bool shutdown = false;
+          if(id(max_exhaust_temp) <= id(exhaust_temp).state){
+            shutdown = true;    
+            ESP_LOGI("custom", "Shutdown max exhaust temp");
+          }
+          if(id(max_floor_temp) <= id(floor_temp).state){
+            shutdown = true;
+            ESP_LOGI("custom", "Shutdown max floor temp");
+          }
+          if(id(max_water_temp) <= (id(water_in).state or id(max_water_temp) <= (id(water_in).state ))){
+            shutdown = true;
+            ESP_LOGI("custom", "Shutdown max water temp");
+          }
+          if(shutdown){
+            id(pump_enable).turn_off();
+            ESP_LOGI("custom", "Shutdown, turn pump off");
+          }
 
+  - id: running_control
+    mode: single
+    then:
+      - lambda: |-
+          int water_power_setting = 2;
+          // if we are close to the safteu temps set power low
+          if((id(max_water_temp) - id(water_out).state) <= 15 ){ // 165
+            water_power_setting = 0;
+            ESP_LOGI("custom", "Set Low max water temp");
+          } else if((id(max_water_temp) - id(water_out).state) <= 30 && (id(max_water_temp) - id(water_out).state) >= 10){  // 150 - 165
+            water_power_setting = 1;
+            ESP_LOGI("custom", "Set Medium max water temp");
+          } else {
+            ESP_LOGI("custom", "Set High max water temp");
+          }
+
+          int floor_power_setting = 2;
+          if((id(max_floor_temp) - id(floor_temp).state) <= 4 ){ // 96
+            floor_power_setting = 0;
+            ESP_LOGI("custom", "Set Low max floor temp");
+          } else if((id(max_floor_temp) - id(floor_temp).state) <= 9 && (id(max_floor_temp) - id(floor_temp).state) >= 6){ // 82
+            floor_power_setting = 1;
+            ESP_LOGI("custom", "Set medium max floor temp");
+          } else {
+            ESP_LOGI("custom", "Set High max floor temp");
+          }
+
+          int exhaust_power_setting = 2;
+          if((id(max_exhaust_temp) - id(exhaust_temp).state) <= 20 ){  // 230 - 20 = 210
+            exhaust_power_setting = 0;
+            ESP_LOGI("custom", "Set Low max exhaust temp");
+          } else if((id(max_exhaust_temp) - id(exhaust_temp).state) <= 45  && (id(max_exhaust_temp) - id(exhaust_temp).state) >= 30){ // 230 - 45 =185 230-30=200
+            exhaust_power_setting = 1;
+            ESP_LOGI("custom", "Set med exhaust temp");
+          } else {
+            ESP_LOGI("custom", "Set Low high exhaust temp");
+          }
+
+          if((exhaust_power_setting == 0) || (floor_power_setting == 0) || (water_power_setting == 0) ){
+            id(set_low).execute();
+            ESP_LOGI("custom", "Setting Low Setting");
+          } else if((exhaust_power_setting == 1) || (floor_power_setting == 1) || (water_power_setting == 1)){
+            id(set_medium).execute();
+            ESP_LOGI("custom", "Setting Medium Setting");
+          } else{
+            id(set_high).execute();
+            ESP_LOGI("custom", "Setting High Setting");
+          }
+          
   - id: start_up1
     mode: single
     then:
       - lambda: |-
-         id(blower_pin).set_level(1);
-         id(glow_plug).set_level(.5);
-      - switch.turn_on: blower_enable
-      - switch.turn_on: water_pump_switch
-      - logger.log: "start up 3"
-      - delay: 60s
-      - switch.turn_off: blower_enable
-  - id: ignitor_start
-    mode: single
-    then:
-      - lambda: id(glow_plug).set_level(1);
-      - output.turn_on: glow_plug
-      - delay: 10s
-  # this is the start script not the run. 
-  - id: run
-    mode: single
-    then:
-      - lambda: |- 
           id(ex_temp_now) = id(exhaust_temp).state;
-          ESP_LOGI("custom", "The temp set value is: %.2f", id(ex_temp_now));
-      - if:
+      - number.set: 
+          id: pump_hz
+          value: 1.0
+      - while:
           condition:
-            not: 
-              switch.is_on: startran  
+            - lambda: |-
+                return (id(ex_temp_now) + 10 > (id(exhaust_temp).state));
           then:
-            - logger.log: "running"
-            - script.execute: start_up1
-            - script.wait: start_up1
-            - logger.log: "done with start up 1"
-            - script.execute: ignitor_start
-            - script.wait: ignitor_start
-            - logger.log: "done with ignitor"
-            - lambda: |-
-                id(blower_pin).set_level(1);
-            #    id(pump_hz).make_call().set_value(2.0).perform();
-            - switch.turn_on: pump_enable      
-            - delay: 10s
-            - logger.log: "rolling"
-                # check exhaust temps if we are in business then run on settings
-                # now figure out power settings and mathcing fan and pump settings
-            - lambda: |-
-                if( id(ex_temp_now) > ((id(exhaust_temp).state) + 10.0)){
-                  id(glow_plug).set_level(0);
-                  id(startup).turn_off();
-                 }
-               #     id(pump_hz).state = round(1.0f + (((id(heater_power).state) - 1.0f) * 5.0f) / 9.0f);
+              - logger.log: "NOT YET"
+              - lambda: |-
+                 id(blower_pin).set_level(.5);
+                 ESP_LOGI("custom", "The Ex Now temp set value is: %.2f", id(ex_temp_now));
+                 ESP_LOGI("custom", "The current ex is temp set value is: %.2f", id(exhaust_temp).state);
+              - switch.turn_on: glow_plug_switch
+              - switch.turn_on: blower_enable
+              - number.set: 
+                  id: blower_percent
+                  value: .3
+              - switch.turn_on: water_pump_switch
+              - logger.log: "start up"
+              - repeat: 
+                  count: 3
+                  then:
+                    - delay: 10s
+                    - switch.turn_on: pump_enable
+                    - number.set:
+                        id: blower_percent
+                        value: 0.7
+                    - delay: 2s
+                    - switch.turn_off: pump_enable
+                    - number.set:
+                        id: blower_percent
+                        value: .3              
 
-                
-         #      id(pump_hz).make_call().set_value(1.0).perform();
-         #      id(pump_loop).execute();
-          # find the level
-        #  // float level = id(heater_power).state * .1;
-         # //id(blower_pin).set_level(level);
-        
+      - logger.log: "leaving the loop"
+      - switch.turn_off: glow_plug_switch
+      - switch.turn_on: pump_enable
+      - script.execute: set_high
+      - switch.turn_off: startup
+  # this is the start script not the run. 
+
+  - id: set_low
+    mode: single
+    then:
+      - number.set: 
+          id: blower_percent
+          value: 0.3
+      - number.set: 
+          id: pump_hz
+          value: 0.3  
+  - id: set_high
+    mode: single
+    then:
+      - number.set: 
+          id: blower_percent
+          value: 1.0
+      - number.set: 
+          id: pump_hz
+          value: 1.2
+  - id: set_medium
+    mode: single
+    then:
+      - number.set: 
+          id: blower_percent
+          value: 0.6
+      - number.set: 
+          id: pump_hz
+          value: 0.8 
       # do some translation for diesel pump
   - id: shutdown2
     mode: single
@@ -363,17 +469,61 @@ script:
       # check temps if low temps slow down fan. 
       - while:
           condition:
-            - lambda: return id(blower_percent).state > .5;
+            - lambda: return id(exhaust_temp).state > 120;
           then:
           # temps > 50 
             - lambda: id(blower_percent).state = .5;
             - delay: 30s
-              
-          
-        
-    
-# on start up run fan for 20secs
-# after 20 seconds run glow plug
-# run glow plug for X seconds
-# after glow plug is warmed i inject some diesel to get it going
-# Once i verify its going, turn off glow plufg
+  - id: scale_heat
+    mode: single
+    then:
+      - while:
+          condition:
+            or:
+              - sensor.in_range:
+                  id: exhaust_temp
+                  above: 199
+              - sensor.in_range:
+                  id: water_out
+                  above: 170
+              - sensor.in_range:
+                  id: floor_temp
+                  above: 90
+          then:
+            - logger.log:
+                format: Slowing it down
+                level: WARN
+            - number.decrement: 
+                id: pump_hz
+                cycle: false
+            - number.decrement: 
+                id: blower_percent
+                cycle: false
+            - delay: 30s 
+      - while:
+          condition:
+            and:
+              - sensor.in_range:
+                  id: floor_temp
+                  below: 80
+              - sensor.in_range:
+                  id: exhaust_temp
+                  below: 180
+              - sensor.in_range:
+                  id: water_out
+                  below: 150
+          then:
+            - logger.log:
+                format: bumping it up
+                level: WARN
+            - if:
+                condition:
+                  lambda: return id(pump_hz).state < 1.1;
+                then:
+                  - number.increment:
+                      id: pump_hz
+                      cycle: false
+            - number.increment: 
+                id: blower_percent
+                cycle: false
+            - delay: 30s
